@@ -23,3 +23,7 @@ embassy-net = { version = "0.4.0", features = ["tcp","proto-ipv4","medium-ethern
 embassy-net-driver = { version = "0.2.0"}
 reqwless = { version = "0.11.0", features = ["alloc", "log"] }
 picoserve = { version = "0.9.1", features = ["embassy"] }
+smart-leds = "0.4.0"
+esp-hal-smartled = {version = "0.8.0", features = ["esp32c3"]}
+palette = { version = "0.7.3", default-features = false, features = ["libm"] }
+esp-hal-common = "0.15.0"

@@ -1,24 +1,26 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
-//#![feature(async_fn_in_trait)]
 
 extern crate alloc;
 
 use core::mem::MaybeUninit;
+use core::sync::atomic::AtomicBool;
 use embassy_executor::Executor;
 use embassy_net::{Config, Stack, StackResources};
 use embassy_time::{Duration, Timer};
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
+use esp_hal_common::rmt::Channel;
+use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
 use hal::{
     clock::ClockControl,
     embassy,
-    gpio::{Gpio3, Output, PushPull},
+    gpio::{Output, PushPull},
     peripherals::Peripherals,
     prelude::*,
     timer::TimerGroup,
-    IO,
+    Rmt, IO,
 };
 
 use esp_wifi::wifi::WifiStaDevice;
@@ -31,11 +33,16 @@ use esp_wifi::{
 use hal::gpio::Gpio8;
 use hal::{systimer::SystemTimer, Rng};
 use log::{error, info};
+use palette::{FromColor, Hsv, Srgb};
 use picoserve::{response::IntoResponse, routing::get, KeepAlive, Router, Timeouts};
+use smart_leds::SmartLedsWrite;
+use smart_leds::RGB8;
 use static_cell::make_static;
 
 const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
+
+static NET_STATUS: AtomicBool = AtomicBool::new(false);
 
 struct EmbassyTimer;
 
@@ -65,20 +72,40 @@ fn init_heap() {
 }
 
 #[embassy_executor::task]
-async fn blink_green(mut pin: Gpio8<Output<PushPull>>) {
+async fn blink_blue(mut pin: Gpio8<Output<PushPull>>) {
     loop {
-        pin.toggle().unwrap();
-        // delay.delay_ms(500u32);
-        Timer::after(Duration::from_millis(200)).await;
+        if NET_STATUS.load(core::sync::atomic::Ordering::Relaxed) {
+            pin.toggle().unwrap();
+        } else {
+            pin.set_high().unwrap();
+        }
+        Timer::after(Duration::from_millis(800)).await;
     }
 }
 
 #[embassy_executor::task]
-async fn blink_red(mut pin: Gpio3<Output<PushPull>>) {
+async fn led_stripe(mut led: SmartLedsAdapter<Channel<0>, 0, 433>) {
+    let mut h: f32 = 0.0;
+    let s: f32 = 1.0;
+    let v: f32 = 0.8;
+    let mut leds: [RGB8; 18] = [RGB8::default(); 18];
     loop {
-        pin.toggle().unwrap();
-        // delay.delay_ms(500u32);
-        Timer::after(Duration::from_millis(330)).await;
+        h += 2.0;
+        if h > 360.0 {
+            h = 0.0;
+        }
+
+        for i in 0..18 {
+            let rgb = Srgb::from_color(Hsv::new(h + (i as f32 * 20.0), s, v));
+            let (r, g, b) = (
+                (rgb.red * 255.0) as u8,
+                (rgb.green * 255.0) as u8,
+                (rgb.blue * 255.0) as u8,
+            );
+            leds[i] = RGB8::new(r, g, b);
+        }
+        led.write(leds.iter().cloned()).unwrap();
+        Timer::after(Duration::from_millis(25)).await;
     }
 }
 
@@ -155,6 +182,7 @@ async fn web_task(
         let mut socket = embassy_net::tcp::TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
 
         info!("Listening on TCP:80...");
+        NET_STATUS.store(true, core::sync::atomic::Ordering::Relaxed);
         if let Err(e) = socket.accept(80).await {
             log::warn!("accept error: {:?}", e);
             continue;
@@ -170,6 +198,7 @@ async fn web_task(
             }
             Err(err) => error!("{err:?}"),
         }
+        NET_STATUS.store(false, core::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -189,7 +218,8 @@ fn main() -> ! {
     info!("Logger is setup");
 
     let io = IO::new(peripherals.GPIO, peripherals.IO_MUX);
-    let pin8 = io.pins.gpio8.into_push_pull_output();
+    let mut pin8 = io.pins.gpio8.into_push_pull_output();
+    pin8.set_high().unwrap();
 
     let executor = make_static!(Executor::new());
 
@@ -229,12 +259,16 @@ fn main() -> ! {
         connection: KeepAlive::Close,
     });
 
+    let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
+    let rmt_buffer = smartLedBuffer!(18);
+    let led = SmartLedsAdapter::new(rmt.channel0, io.pins.gpio0, rmt_buffer);
+
     embassy::init(&clocks, timer_group);
 
     executor.run(|spawner| {
-        spawner.spawn(blink_green(pin8)).unwrap();
-        //spawner.spawn(blink_red(pin3)).unwrap();
+        spawner.spawn(blink_blue(pin8)).unwrap();
         spawner.spawn(connection(controller)).unwrap();
+        spawner.spawn(led_stripe(led)).unwrap();
         spawner.spawn(net_task(stack)).unwrap();
         spawner.spawn(web_task(stack, config)).unwrap();
     })
