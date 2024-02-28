@@ -3,7 +3,7 @@ name = "led-lamp2"
 version = "0.1.0"
 authors = ["Kay Hannay <klinux@hannay.de>"]
 edition = "2021"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 
 [dependencies]
 hal = { package = "esp32c3-hal", version = "0.15.0", features=["embassy","async","embassy-time-timg0"] }
