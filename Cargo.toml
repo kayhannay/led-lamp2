@@ -27,3 +27,5 @@ smart-leds = "0.4.0"
 esp-hal-smartled = {version = "0.8.0", features = ["esp32c3"]}
 palette = { version = "0.7.3", default-features = false, features = ["libm"] }
 esp-hal-common = "0.15.0"
+embassy-sync = "0.5.0"
+serde = { version = "1.0", default-features = false, features = ["derive"] }

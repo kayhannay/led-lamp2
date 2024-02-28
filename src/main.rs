@@ -1,18 +1,22 @@
 #![no_std]
 #![no_main]
 #![feature(type_alias_impl_trait)]
+#![feature(const_mut_refs)]
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use core::mem::MaybeUninit;
 use core::sync::atomic::AtomicBool;
 use embassy_executor::Executor;
 use embassy_net::{Config, Stack, StackResources};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use embedded_svc::wifi::{ClientConfiguration, Configuration, Wifi};
 use esp_backtrace as _;
 use esp_hal_common::rmt::Channel;
-use esp_hal_smartled::{smartLedBuffer, SmartLedsAdapter};
+use esp_hal_smartled::SmartLedsAdapter;
 use hal::{
     clock::ClockControl,
     embassy,
@@ -35,7 +39,8 @@ use hal::{systimer::SystemTimer, Rng};
 use log::{error, info};
 use palette::{FromColor, Hsv, Srgb};
 use picoserve::{response::IntoResponse, routing::get, KeepAlive, Router, Timeouts};
-use smart_leds::SmartLedsWrite;
+use picoserve::extract::{Form, FromRequest};
+use smart_leds::{RGB, SmartLedsWrite};
 use smart_leds::RGB8;
 use static_cell::make_static;
 
@@ -43,6 +48,10 @@ const SSID: &str = env!("SSID");
 const PASSWORD: &str = env!("PASSWORD");
 
 static NET_STATUS: AtomicBool = AtomicBool::new(false);
+
+static LED_STRIPE_MODE: Mutex<CriticalSectionRawMutex, RGB8> = Mutex::new(RGB8::new(0, 0, 0));
+
+const NUM_LEDS: usize = 18;
 
 struct EmbassyTimer;
 
@@ -88,21 +97,34 @@ async fn led_stripe(mut led: SmartLedsAdapter<Channel<0>, 0, 433>) {
     let mut h: f32 = 0.0;
     let s: f32 = 1.0;
     let v: f32 = 0.8;
-    let mut leds: [RGB8; 18] = [RGB8::default(); 18];
+    let mut leds: [RGB8; NUM_LEDS] = [RGB8::default(); NUM_LEDS];
+    let mut led_mode: RGB8;
+    let led_init = RGB::new(0u8,0u8,0u8);
     loop {
         h += 2.0;
         if h > 360.0 {
             h = 0.0;
         }
 
-        for i in 0..18 {
-            let rgb = Srgb::from_color(Hsv::new(h + (i as f32 * 20.0), s, v));
-            let (r, g, b) = (
-                (rgb.red * 255.0) as u8,
-                (rgb.green * 255.0) as u8,
-                (rgb.blue * 255.0) as u8,
-            );
-            leds[i] = RGB8::new(r, g, b);
+        {
+            led_mode = LED_STRIPE_MODE.lock().await.to_owned().clone();
+        }
+
+        if led_mode == led_init {
+            for i in 0..NUM_LEDS {
+                let rgb = Srgb::from_color(Hsv::new(h + (i as f32 * 20.0), s, v));
+                let (r, g, b) = (
+                    (rgb.red * 255.0) as u8,
+                    (rgb.green * 255.0) as u8,
+                    (rgb.blue * 255.0) as u8,
+                );
+                leds[i] = RGB8::new(r, g, b);
+            }
+        } else {
+            info!("Static mode: {:?}", led_mode);
+            for i in 0..NUM_LEDS {
+                leds[i] = led_mode.clone();
+            }
         }
         led.write(leds.iter().cloned()).unwrap();
         Timer::after(Duration::from_millis(25)).await;
@@ -151,7 +173,93 @@ async fn net_task(stack: &'static Stack<WifiDevice<'static, WifiStaDevice>>) {
 }
 
 async fn get_root() -> impl IntoResponse {
-    "Hello from rainbow lamp!"
+    picoserve::response::File::html(include_str!("index.html"))
+}
+
+enum BadRequest {
+    ReadError,
+}
+
+impl IntoResponse for BadRequest {
+    async fn write_to<
+        R: picoserve::io::Read,
+        W: picoserve::response::ResponseWriter<Error = R::Error>,
+    >(
+        self,
+        connection: picoserve::response::Connection<'_, R>,
+        response_writer: W,
+    ) -> Result<picoserve::ResponseSent, W::Error> {
+
+        (
+            picoserve::response::status::BAD_REQUEST,
+            format_args!("Read Error"),
+        )
+            .write_to(connection, response_writer)
+            .await
+    }
+
+}
+
+#[derive(serde::Deserialize)]
+struct FormValue {
+    mode: heapless::String<32>,
+    r: u8,
+    g: u8,
+    b: u8
+}
+
+struct LedSettings {
+    mode: LedMode,
+    r: u8,
+    g: u8,
+    b: u8
+}
+
+#[derive(Debug)]
+enum LedMode {
+    Rainbow,
+    Static
+}
+
+impl<State> FromRequest<State> for LedSettings {
+    type Rejection = BadRequest;
+
+    async fn from_request<R: picoserve::io::Read>(
+        _state: &State,
+        _request_parts: picoserve::request::RequestParts<'_>,
+        request_body: picoserve::request::RequestBody<'_, R>,
+    ) -> Result<Self, Self::Rejection> {
+        let form: Form<FormValue> = Form::from_request(_state, _request_parts, request_body).await.map_err(|_err| BadRequest::ReadError)?;
+        Ok(LedSettings {
+            mode: match form.mode.as_str() {
+                "rainbow" => LedMode::Rainbow,
+                "static" => LedMode::Static,
+                _ => LedMode::Rainbow
+            },
+            r: form.r,
+            g: form.g,
+            b: form.b
+        })
+    }
+}
+
+async fn post_root(LedSettings { mode, r, g, b }: LedSettings) -> impl IntoResponse {
+    info!("mode: {:?}, r: {r}, g: {g}, b: {b}", mode);
+    match mode {
+        LedMode::Rainbow => {
+            let mut rgb = LED_STRIPE_MODE.lock().await;
+            rgb.r = 0;
+            rgb.g = 0;
+            rgb.b = 0;
+        }
+        LedMode::Static => {
+            let mut rgb = LED_STRIPE_MODE.lock().await;
+            rgb.r = r;
+            rgb.g = g;
+            rgb.b = b;
+        }
+    }
+    picoserve::response::Redirect::to("/")
 }
 
 #[embassy_executor::task]
@@ -190,8 +298,10 @@ async fn web_task(
 
         info!("Received connection from {:?}", socket.remote_endpoint());
 
-        let app = Router::new().route("/", get(get_root));
+        let app = Router::new()
+            .route("/", get(get_root).post(post_root));
 
+        info!("Serving...");
         match picoserve::serve(&app, config, &mut [0; 2048], socket).await {
             Ok(handled_requests_count) => {
                 info!("{handled_requests_count} requests handled");
@@ -260,7 +370,7 @@ fn main() -> ! {
     });
 
     let rmt = Rmt::new(peripherals.RMT, 80u32.MHz(), &clocks).unwrap();
-    let rmt_buffer = smartLedBuffer!(18);
+    let rmt_buffer = [0u32; NUM_LEDS * 24 + 1];
     let led = SmartLedsAdapter::new(rmt.channel0, io.pins.gpio0, rmt_buffer);
 
     embassy::init(&clocks, timer_group);
